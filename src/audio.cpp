@@ -167,7 +167,14 @@ namespace audio {
     }
 
     // Prefer the virtual sink if host playback is disabled or there's no other sink
-    if (ref->sink.null && (!config.flags[config_t::HOST_AUDIO] || sink->empty())) {
+#ifdef _WIN32
+    // Cronos: no Windows a captura e por processo (tudo menos o Discord), entao o som do dono
+    // fica onde esta mesmo sem "audio on host" -- o virtual so entra se nao houver outra saida.
+    const bool prefer_virtual = sink->empty();
+#else
+    const bool prefer_virtual = !config.flags[config_t::HOST_AUDIO] || sink->empty();
+#endif
+    if (ref->sink.null && prefer_virtual) {
       auto &null = *ref->sink.null;
       switch (stream.channelCount) {
         case 2:

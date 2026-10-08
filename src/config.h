@@ -158,6 +158,8 @@ namespace config {
     bool install_steam_drivers;
     bool keep_default;
     bool auto_capture;
+    // Cronos: nomes de exe (separados por virgula) cujo som NAO vai pro convidado (Windows)
+    std::string exclude_process;
   };
 
   constexpr int ENCRYPTION_MODE_NEVER = 0;  // Never use video encryption, even if the client supports it

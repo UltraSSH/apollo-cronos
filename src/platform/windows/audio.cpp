@@ -11,6 +11,7 @@
 #include <newdev.h>
 #include <roapi.h>
 #include <synchapi.h>
+#include <tlhelp32.h>
 
 // local includes
 #include "misc.h"
@@ -351,6 +352,188 @@ namespace platf::audio {
     return device;
   }
 
+  // ---------- Cronos: tudo menos o Discord ----------
+  // Captura por processo do Windows 10 2004+ ("process loopback") no modo que EXCLUI uma arvore
+  // de processos: o som do dono continua no dispositivo dele e o Discord (voz da chamada) nao
+  // vai pro convidado, toque ele onde tocar. O MinGW nao traz o audioclientactivationparams.h
+  // nem declara o ActivateAudioInterfaceAsync: as estruturas vao aqui e a funcao vem da dll.
+  struct cronos_activation_params_t {
+    DWORD activation_type;  // AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1
+    DWORD target_process_id;
+    DWORD loopback_mode;  // PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE = 1
+  };
+
+  using activate_audio_interface_async_fn = HRESULT(WINAPI *)(LPCWSTR, REFIID, PROPVARIANT *, IActivateAudioInterfaceCompletionHandler *, IActivateAudioInterfaceAsyncOperation **);
+
+  class cronos_activation_t: public IActivateAudioInterfaceCompletionHandler, public IAgileObject {
+  public:
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HRESULT status = E_FAIL;
+    IAudioClient *client = nullptr;
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppv) override {
+      if (riid == IID_IUnknown || riid == IID_IActivateAudioInterfaceCompletionHandler) {
+        *ppv = static_cast<IActivateAudioInterfaceCompletionHandler *>(this);
+      } else if (riid == IID_IAgileObject) {
+        *ppv = static_cast<IAgileObject *>(this);
+      } else {
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+      }
+      AddRef();
+      return S_OK;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+      return InterlockedIncrement(&refs);
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+      auto r = InterlockedDecrement(&refs);
+      if (!r) {
+        if (client) {
+          client->Release();
+        }
+        CloseHandle(done);
+        delete this;
+      }
+      return r;
+    }
+
+    HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation *op) override {
+      IUnknown *unknown = nullptr;
+      HRESULT activate_status = E_FAIL;
+      status = op->GetActivateResult(&activate_status, &unknown);
+      if (SUCCEEDED(status)) {
+        status = activate_status;
+      }
+      if (SUCCEEDED(status)) {
+        status = unknown->QueryInterface(IID_IAudioClient, (void **) &client);
+      }
+      if (unknown) {
+        unknown->Release();
+      }
+      SetEvent(done);
+      return S_OK;
+    }
+
+  private:
+    LONG refs = 1;
+  };
+
+  /**
+   * @brief Raiz da arvore de um dos programas de `config::audio.exclude_process` (o som do
+   * Discord sai de um processo filho; excluir a arvore pega todos). 0 = nenhum aberto.
+   */
+  DWORD cronos_excluded_root_pid() {
+    std::vector<std::wstring> names;
+    {
+      auto list = from_utf8(config::audio.exclude_process);
+      std::size_t start = 0;
+      while (start <= list.size()) {
+        auto end = list.find(L',', start);
+        if (end == std::wstring::npos) {
+          end = list.size();
+        }
+        auto name = list.substr(start, end - start);
+        name.erase(0, name.find_first_not_of(L' '));
+        name.erase(name.find_last_not_of(L' ') + 1);
+        if (!name.empty()) {
+          names.push_back(name);
+        }
+        start = end + 1;
+      }
+    }
+    if (names.empty()) {
+      return 0;
+    }
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+      return 0;
+    }
+    std::vector<PROCESSENTRY32W> processes;
+    PROCESSENTRY32W entry {};
+    entry.dwSize = sizeof(entry);
+    for (auto ok = Process32FirstW(snapshot, &entry); ok; ok = Process32NextW(snapshot, &entry)) {
+      processes.push_back(entry);
+    }
+    CloseHandle(snapshot);
+
+    for (const auto &name : names) {
+      for (const auto &p : processes) {
+        if (_wcsicmp(p.szExeFile, name.c_str())) {
+          continue;
+        }
+        // Pai com o mesmo nome = filho da arvore; a raiz e quem nao tem.
+        auto parent_same_name = std::any_of(processes.begin(), processes.end(), [&](const auto &q) {
+          return q.th32ProcessID == p.th32ParentProcessID && !_wcsicmp(q.szExeFile, p.szExeFile);
+        });
+        if (!parent_same_name) {
+          return p.th32ProcessID;
+        }
+      }
+    }
+    return 0;
+  }
+
+  audio_client_t make_process_loopback_client(DWORD excluded_pid, const format_t &format) {
+    static auto activate = (activate_audio_interface_async_fn) GetProcAddress(LoadLibraryW(L"Mmdevapi.dll"), "ActivateAudioInterfaceAsync");
+    if (!activate) {
+      return nullptr;
+    }
+
+    // Sem programa pra excluir: exclui o proprio Apollo (que nao toca som) = tudo.
+    cronos_activation_params_t params {1, excluded_pid ? excluded_pid : GetCurrentProcessId(), 1};
+    PROPVARIANT activation {};
+    activation.vt = VT_BLOB;
+    activation.blob.cbSize = sizeof(params);
+    activation.blob.pBlobData = (BYTE *) &params;
+
+    auto handler = new cronos_activation_t();
+    IActivateAudioInterfaceAsyncOperation *op = nullptr;
+    auto status = activate(L"VAD\\Process_Loopback", IID_IAudioClient, &activation, handler, &op);
+    if (SUCCEEDED(status) && WaitForSingleObject(handler->done, 5000) != WAIT_OBJECT_0) {
+      status = HRESULT_FROM_WIN32(WAIT_TIMEOUT);
+    } else if (SUCCEEDED(status)) {
+      status = handler->status;
+    }
+
+    audio_client_t audio_client;
+    if (SUCCEEDED(status)) {
+      audio_client.reset(handler->client);
+      handler->client = nullptr;
+    }
+    if (op) {
+      op->Release();
+    }
+    handler->Release();
+
+    if (FAILED(status)) {
+      BOOST_LOG(warning) << "Cronos: process loopback indisponivel [0x"sv << util::hex(status).to_string_view() << ']';
+      return nullptr;
+    }
+
+    // Process loopback nao tem GetMixFormat nem aceita AUTOCONVERTPCM: ja entrega no formato pedido.
+    WAVEFORMATEXTENSIBLE capture_waveformat =
+      create_waveformat(sample_format_e::f32, format.channel_count, format.capture_waveformat_channel_mask);
+    status = audio_client->Initialize(
+      AUDCLNT_SHAREMODE_SHARED,
+      AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+      200000,  // 20 ms
+      0,
+      (LPWAVEFORMATEX) &capture_waveformat,
+      nullptr
+    );
+    if (FAILED(status)) {
+      BOOST_LOG(warning) << "Cronos: process loopback recusou ["sv << format.name << "]: [0x"sv << util::hex(status).to_string_view() << ']';
+      return nullptr;
+    }
+
+    BOOST_LOG(info) << "Cronos: capturando tudo menos o processo "sv << excluded_pid << " (0 = nenhum aberto) em "sv << logging::bracket(waveformat_to_pretty_string(capture_waveformat));
+    return audio_client;
+  }
+
   class audio_notification_t: public ::IMMNotificationClient {
   public:
     audio_notification_t() {
@@ -476,25 +659,43 @@ namespace platf::audio {
         return -1;
       }
 
-      auto device = default_device(device_enum);
-      if (!device) {
-        return -1;
-      }
-
+      // Cronos: tudo menos o Discord. Windows antigo ou formato recusado = captura da saida
+      // padrao como o Apollo original.
+      excluded_pid = cronos_excluded_root_pid();
+      next_exclusion_check = GetTickCount64() + 2000;
       for (const auto &format : formats) {
         if (format.channel_count != channels_out) {
-          BOOST_LOG(debug) << "Skipping audio format ["sv << format.name << "] with channel count ["sv
-                           << format.channel_count << " != "sv << channels_out << ']';
           continue;
         }
-
-        BOOST_LOG(debug) << "Trying audio format ["sv << format.name << ']';
-        audio_client = make_audio_client(device, format);
-
+        audio_client = make_process_loopback_client(excluded_pid, format);
         if (audio_client) {
-          BOOST_LOG(debug) << "Found audio format ["sv << format.name << ']';
+          process_loopback = true;
           channels = channels_out;
           break;
+        }
+      }
+
+      if (!audio_client) {
+        auto device = default_device(device_enum);
+        if (!device) {
+          return -1;
+        }
+
+        for (const auto &format : formats) {
+          if (format.channel_count != channels_out) {
+            BOOST_LOG(debug) << "Skipping audio format ["sv << format.name << "] with channel count ["sv
+                             << format.channel_count << " != "sv << channels_out << ']';
+            continue;
+          }
+
+          BOOST_LOG(debug) << "Trying audio format ["sv << format.name << ']';
+          audio_client = make_audio_client(device, format);
+
+          if (audio_client) {
+            BOOST_LOG(debug) << "Found audio format ["sv << format.name << ']';
+            channels = channels_out;
+            break;
+          }
         }
       }
 
@@ -503,7 +704,7 @@ namespace platf::audio {
         return -1;
       }
 
-      REFERENCE_TIME default_latency;
+      REFERENCE_TIME default_latency = 100000;  // process loopback pode nao informar o periodo
       audio_client->GetDevicePeriod(&default_latency, nullptr);
       default_latency_ms = default_latency / 1000;
 
@@ -580,8 +781,22 @@ namespace platf::audio {
         std::uint32_t audio_sample_size;
       } block_aligned;
 
+      if (process_loopback) {
+        // A captura nao depende da saida padrao (a troca so zera o aviso). Programa excluido
+        // abriu, fechou ou reiniciou: refaz a captura com a arvore certa.
+        endpt_notification.check_default_render_device_changed();
+        auto now = GetTickCount64();
+        if (now >= next_exclusion_check) {
+          next_exclusion_check = now + 2000;
+          auto pid = cronos_excluded_root_pid();
+          if (pid != excluded_pid) {
+            BOOST_LOG(info) << "Cronos: processo excluido mudou ("sv << excluded_pid << " -> "sv << pid << ')';
+            return capture_e::reinit;
+          }
+        }
+      }
       // Check if the default audio device has changed
-      if (endpt_notification.check_default_render_device_changed()) {
+      else if (endpt_notification.check_default_render_device_changed()) {
         // Invoke the audio_control_t's callback if it wants one
         if (default_endpt_changed_cb) {
           (*default_endpt_changed_cb)();
@@ -678,6 +893,10 @@ namespace platf::audio {
     int channels;
 
     HANDLE mmcss_task_handle = NULL;
+
+    bool process_loopback = false;
+    DWORD excluded_pid = 0;
+    ULONGLONG next_exclusion_check = 0;
   };
 
   class audio_control_t: public ::platf::audio_control_t {

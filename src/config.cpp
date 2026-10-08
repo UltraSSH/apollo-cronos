@@ -525,6 +525,7 @@ namespace config {
     true,  // install_steam_drivers
     true, // keep_sink_default
     true, // auto_capture
+    "Discord.exe,DiscordPTB.exe,DiscordCanary.exe",  // exclude_process
   };
 
   stream_t stream {
@@ -1225,6 +1226,7 @@ namespace config {
 
     string_f(vars, "audio_sink", audio.sink);
     string_f(vars, "virtual_sink", audio.virtual_sink);
+    string_f(vars, "audio_exclude_process", audio.exclude_process);
     bool_f(vars, "stream_audio", audio.stream);
     bool_f(vars, "install_steam_audio_drivers", audio.install_steam_drivers);
     bool_f(vars, "keep_sink_default", audio.keep_default);
